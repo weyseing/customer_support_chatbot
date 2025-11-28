@@ -1,6 +1,6 @@
 # High-Level Architecture for a Searchable Knowledge-Base Chatbot (LLM + RAG)
 
-Below is a high-level but technically strong outline suitable for an interview, showing clear architectural thinking without going into code-level implementation.
+Below is a high-level but technically strong outline, showing clear architectural thinking without going into code-level implementation.
 
 ---
 
@@ -132,7 +132,3 @@ This is the RAG (Retrieval-Augmented Generation) layer.
   - Versioned docs and incremental ingestion  
   - Guardrails and hallucination reduction  
 
----
-
-## 6. **Summary for Interview**
-“I would implement a pipeline that ingests documents, cleans and chunks them, generates embeddings, stores them in a vector database with metadata, and uses a Retrieval-Augmented Generation layer where an LLM answers user questions strictly grounded in retrieved context. The architecture ensures scalability, low latency, and high answer accuracy.”
