@@ -1,96 +1,221 @@
-### **1. Document Ingestion Pipeline**
+## **Architecting a Searchable Knowledge Base Chatbot using Retrieval-Augmented Generation (RAG)**
 
-**A. Data Acquisition & Preprocessing**
+The solution employs the **Retrieval-Augmented Generation (RAG)** pattern to build a robust, searchable knowledge base chatbot. This architecture mitigates common LLM challenges such as **hallucination** and **knowledge cutoff**, ensuring responses are accurate, current, and verifiable.
 
-* **Connectors**: Build modular connectors for multiple sources (S3, SharePoint, Confluence, Jira, PDFs, HTML, APIs)
-* **Content Extraction**: Use specialized parsers:
-  * **PDFs**: PyMuPDF, Unstructured.io for layout-aware extraction (preserving tables)
-  * **HTML**: BeautifulSoup4 with CSS selectors for main content (avoiding headers/footers)
-  * **Structured Data**: Convert databases/API responses to markdown-format text
-* **Deduplication**: Use MinHash + LSH or semantic embeddings (cosine similarity \> 0.95) to detect near-duplicates
-
-**B. Intelligent Chunking**
-
-* **Hybrid Strategy**: Combine semantic and structural chunking:
-  * **Initial split**: Use document structure (headings, paragraphs) as boundaries
-  * **Merge small chunks**: Combine related sentences using embedding similarity
-  * **Optimal size**: 512-1024 tokens with 20% overlap for context preservation
-* **Metadata Enrichment**: Attach source URL, last updated timestamp, document hierarchy, customer tier (if multi-tenant), and chunk position
-
-**C. Embedding Generation**
-
-* **Model Selection**: Use `text-embedding-3-large` (OpenAI) or `BGE-large-en-v1.5` (open-source) for quality; `text-embedding-3-small` for cost/performance
-* **Batching**: Process chunks in parallel batches (rate limit aware)
-* **Versioning**: Store embedding model version with vectors for easy future re-indexing
+Conceptual RAG Architecture:
 
 ---
 
-### **2. Storage & Efficient Retrieval**
+### 1. Ingest Documents: The ETL and Vectorization Pipeline
 
-**A. Vector Database Architecture**
+This is an **asynchronous, offline ETL (Extract, Transform, Load)** process that prepares raw documents for efficient retrieval.
 
-* **Technology**: Choose **Pinecone Serverless** (managed) or **Qdrant/Milvus** (self-hosted) for production scale
-* **Index Configuration**:
-  * **Algorithm**: HNSW (Hierarchical Navigable Small World) for low-latency (\<10ms) approximate nearest neighbor search
-  * **Parameters**: `M=16`, `efConstruction=200` for recall/latency tradeoff
-  * **Vector dimension**: 1536 (OpenAI) or 1024 (BGE)
+<table>
+<tr>
+<td>
 
-**B. Hybrid Search System**
+**Phase**
+</td>
+<td>
 
-* **Two-stage retrieval**:
-  1. **Dense retrieval**: Vector similarity search (top-100)
-  2. **Sparse retrieval**: BM25 on extracted keywords for lexical matching
-* **Fusion**: Use Reciprocal Rank Fusion (RRF) to combine and re-rank results
-* **Metadata Filtering**: Pre-filter by customer tier, product version, or doc category before vector search (reduces search space by 90%)
+**Technical Description**
+</td>
+<td>
 
-**C. Performance Optimization**
+**Key Technologies/Considerations**
+</td>
+</tr>
+<tr>
+<td>
 
-* **Caching**: Redis for hot queries (first 24h), semantic cache (FAISS index of recent queries)
-* **Sharding**: Shard by customer/region for data isolation and horizontal scaling
-* **Replication**: 3 replicas for high availability and read scaling
+**Extract**
+</td>
+<td>
 
----
+**Source Acquisition:** Ingests heterogeneous document types from various data sources (e.g., S3 buckets, SharePoint, internal databases). Converts proprietary formats (PDF, DOCX) into plain text.
+</td>
+<td>Data loaders (LlamaIndex, LangChain), Apache Tika, OCR services for image-based documents.</td>
+</tr>
+<tr>
+<td>
 
-### **3. Fast & Accurate Answer Generation**
+**Transform**
+</td>
+<td>
 
-**A. Retrieval-Augmented Generation (RAG) Pipeline**
+**Intelligent Segmentation (Chunking):** Breaks down large documents into smaller, semantically coherent `chunks`. Employs **Recursive Character Splitting** to respect document structure. Maintains a controlled **semantic overlap** (e.g., 10-15% of chunk size) between adjacent chunks to preserve context across boundaries.
+</td>
+<td>Text splitters (LangChain), custom logic for domain-specific chunking, tokenizers for length management.</td>
+</tr>
+<tr>
+<td>
 
-* **Query Understanding**: Use LLM to rewrite/expand user queries (hyde approach for ambiguous questions)
-* **Context Retrieval**:
-  * **Reranking**: Apply cross-encoder (Cohere rerank or `ms-marco-MiniLM-L-6-v2`) on top-50 results to get final top-5 chunks
-  * **Context windows**: Fit \~5 chunks (4k tokens) into LLM context, prioritizing reranked order
-* **LLM Selection**:
-  * **Primary**: GPT-4-turbo for accuracy (complex queries)
-  * **Fallback**: Mixtral-8x7B or Claude-3-Sonnet for latency-sensitive cases
-  * **Streaming**: Enable token streaming for \<1s time-to-first-token
+**Load (Vectorization)**
+</td>
+<td>
 
-**B. Accuracy & Guardrails**
-
-* **Prompt Engineering**:
-
-  Copy
-
-  `"You are a support agent. Answer based ONLY on provided context. 
-  If uncertain, respond: 'I don't have that information.' 
-  Cite sources with [doc:filename]."`
-* **Hallucination Detection**:
-  * Faithfulness check: Use NLI model to verify answer is entailed by context
-  * **Confidence scoring**: If faithfulness \< 0.8, trigger escalation
-* **Human-in-the-loop**: Log low-confidence answers for expert review, auto-retrain on corrections
-
-**C. Latency & Scalability**
-
-* **Async processing**: Celery/Ray for batch ingestion (1000+ docs/hour)
-* **Caching**: Cache common answers (e.g., "how to reset password") in Redis TTL=24h
-* **AB testing**: Route 10% traffic to new embedding models for offline evaluation
-* **Monitoring**: Track **p95 latency**, **retrieval recall@5**, and **answer acceptance rate** via LangSmith/Phoenix
+**Embedding Generation:** Each text chunk is passed through a pre-trained **Sentence Transformer Model** (e.g., BGE-M3, MiniLM). This converts the text into a high-dimensional **dense vector embedding** ($\\mathbf{v}\_i \\in \\mathbb{R}^d$), mathematically representing its semantic meaning.
+</td>
+<td>Embeddings models (Hugging Face Transformers), ONNX Runtime for inference optimization.</td>
+</tr>
+</table>
 
 ---
 
-### **Key Metrics to Track**
+### 2. Store and Retrieve: High-Performance Vector Indexing
 
-* **Ingestion**: Docs/hour, failed parse rate (\<1%)
-* **Retrieval**: Query latency p95 (\<100ms), recall@5 (\>85%)
-* **Generation**: TTFT (\<1s), hallucination rate (\<5%), resolution rate (\>70%)
+This stage establishes the persistence layer and the core retrieval mechanism for the knowledge base.
 
-This architecture balances quality, cost, and speed while maintaining production reliability.
+<table>
+<tr>
+<td>
+
+**Component**
+</td>
+<td>
+
+**Technical Description**
+</td>
+<td>
+
+**Key Technologies/Algorithms**
+</td>
+</tr>
+<tr>
+<td>
+
+**Vector Database**
+</td>
+<td>
+
+Stores the generated vector embeddings ($\\mathbf{v}\_i$) along with their associated metadata (e.g., `document_id`, `creation_date`, `security_group`). Optimized for high-throughput, low-latency vector similarity search.
+</td>
+<td>Pinecone, Weaviate, Milvus, ChromaDB, pgvector (PostgreSQL extension with HNSW).</td>
+</tr>
+<tr>
+<td>
+
+**Indexing**
+</td>
+<td>
+
+Implements an **Approximate Nearest Neighbors (ANN)** algorithm, such as **Hierarchical Navigable Small World (HNSW)**, or **Inverted File System (IVF)**. These algorithms provide logarithmic or near-constant time search performance ($\\mathcal{O}(\\log n)$) over large datasets.
+</td>
+<td>HNSW, IVF_FLAT, IVFPQ.</td>
+</tr>
+<tr>
+<td>
+
+**Context Retrieval**
+</td>
+<td>
+
+When a user query $Q$ is received, it's first vectorized into a query embedding $\\mathbf{q}$ using the **identical embedding model**. A similarity search (typically **Cosine Similarity** or **Dot Product**) is performed against the vector index to identify the top $k$ most relevant chunks.
+</td>
+<td>Query embedder, vector database client, Cosine Similarity, Dot Product.</td>
+</tr>
+<tr>
+<td>
+
+**Metadata Filtering**
+</td>
+<td>
+
+**Pre-filtering** using metadata (e.g., filtering by user's department, document access rights from ACLs, or date range) is applied _before_ or _during_ the ANN search to narrow the search space, improving both precision and adherence to security policies.
+</td>
+<td>SQL-like query language support in vector DBs, attribute-based access control (ABAC).</td>
+</tr>
+</table>
+
+---
+
+### 3. Ensure Fast and Accurate Answers: Prompt Engineering and LLM Synthesis
+
+This is the final generative stage, focusing on **precision, speed, and trustworthiness** of the LLM's output.
+
+<table>
+<tr>
+<td>
+
+**Aspect**
+</td>
+<td>
+
+**Technical Strategy**
+</td>
+<td>
+
+**Impact on Speed & Accuracy**
+</td>
+</tr>
+<tr>
+<td>
+
+**Prompt Orchestration**
+</td>
+<td>
+
+Dynamically constructs a comprehensive **System Prompt** for the LLM. This prompt explicitly **grounds** the LLM's response using the retrieved context.
+
+$$\\text{Prompt} = \\text{System Role/Instruction} + \\{\\text{Context}\_1, \\dots, \\text{Context}\_k\\} + \\text{User Query}$$
+</td>
+<td>
+
+**Accuracy:** Eliminates hallucinations by constraining the LLM to the provided facts. Ensures **Fidelity** to the knowledge base.
+</td>
+</tr>
+<tr>
+<td>
+
+**Re-ranking**
+</td>
+<td>
+
+After initial retrieval, a smaller, more precise **Cross-Encoder Model** (e.g., a fine-tuned BERT model) is used to re-score the top $k$ retrieved chunks. This selects only the most semantically relevant chunks for the final prompt, addressing potential noise from the ANN search.
+</td>
+<td>
+
+**Accuracy:** Significantly boosts **Mean Average Precision (MAP)** and **Recall@$k$** by refining the context, ensuring the LLM receives the most pertinent information.
+</td>
+</tr>
+<tr>
+<td>
+
+**Context Condensation**
+</td>
+<td>
+
+If the aggregate token count of the re-ranked chunks exceeds optimal LLM input limits or causes high latency, a smaller, faster LLM can perform **extractive or abstractive summarization** on the context _before_ it's sent to the main generative LLM.
+</td>
+<td>
+
+**Speed:** Reduces the input token count to the main LLM, leading to lower inference latency and reduced API costs. **Accuracy:** Maintains essential information while discarding redundancy.
+</td>
+</tr>
+<tr>
+<td>
+
+**Response Validation & Attribution**
+</td>
+<td>
+
+Implement post-generation checks, such as **fact-checking** against the source context or confidence scoring. The system explicitly provides **source citations** (e.g., "Source: \[Document Title\]").
+</td>
+<td>
+
+**Trust:** Builds user confidence by providing verifiable sources. **Accuracy:** Helps detect and flag potential residual hallucinations or low-confidence responses.
+</td>
+</tr>
+<tr>
+<td>
+
+**LLM Inference Optimization**
+</td>
+<td>
+
+Utilizes **optimized LLM serving frameworks** (e.g., vLLM, TensorRT-LLM) for low-latency inference on the chosen generative model (e.g., GPT-4, Claude, Llama 3). Incorporates **batching** and **quantization** techniques.
+</td>
+<td></td>
+</tr>
+</table>
+
