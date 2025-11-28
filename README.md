@@ -1,141 +1,96 @@
-# Technical Architecture: Production-Grade RAG System for Customer Support
+### **1. Document Ingestion Pipeline**
 
-This document outlines the architecture for a Production-Grade Retrieval-Augmented Generation (RAG) system, designed to power a robust customer support chatbot. The goal is to deliver highly accurate, low-latency, and contextually relevant answers by combining the power of Large Language Models (LLMs) with a curated knowledge base.
+**A. Data Acquisition & Preprocessing**
 
-## 1. Advanced Ingestion Pipeline (ETL)
+* **Connectors**: Build modular connectors for multiple sources (S3, SharePoint, Confluence, Jira, PDFs, HTML, APIs)
+* **Content Extraction**: Use specialized parsers:
+  * **PDFs**: PyMuPDF, Unstructured.io for layout-aware extraction (preserving tables)
+  * **HTML**: BeautifulSoup4 with CSS selectors for main content (avoiding headers/footers)
+  * **Structured Data**: Convert databases/API responses to markdown-format text
+* **Deduplication**: Use MinHash + LSH or semantic embeddings (cosine similarity \> 0.95) to detect near-duplicates
 
-The ingestion pipeline is designed for high-fidelity data processing and resilience, transforming diverse source documents into optimized vector representations.
+**B. Intelligent Chunking**
 
-**Visual Cue:** _Imagine a flowchart for the ingestion pipeline._
+* **Hybrid Strategy**: Combine semantic and structural chunking:
+  * **Initial split**: Use document structure (headings, paragraphs) as boundaries
+  * **Merge small chunks**: Combine related sentences using embedding similarity
+  * **Optimal size**: 512-1024 tokens with 20% overlap for context preservation
+* **Metadata Enrichment**: Attach source URL, last updated timestamp, document hierarchy, customer tier (if multi-tenant), and chunk position
 
-`[Document Sources: PDFs, HTML, Docs, CSVs]
-       ↓
-[Data Ingestion Service]
-       ↓ (Event Queue: Kafka/SQS)
-[Parsing & Preprocessing Worker Pool]
-       ↓
-[Semantic Chunking Module]
-       ↓
-[Metadata Extraction & Enrichment Service]
-       ↓
-[Embedding Generation Service]
-       ↓
-[Vector Database Write API]
-`
+**C. Embedding Generation**
 
-### Key Components & Strategies:
+* **Model Selection**: Use `text-embedding-3-large` (OpenAI) or `BGE-large-en-v1.5` (open-source) for quality; `text-embedding-3-small` for cost/performance
+* **Batching**: Process chunks in parallel batches (rate limit aware)
+* **Versioning**: Store embedding model version with vectors for easy future re-indexing
 
-* **Event-Driven ETL:** An event streaming platform (e.g., Apache Kafka, AWS SQS) will manage document processing. This allows for asynchronous, scalable, and fault-tolerant ingestion.
-* **Intelligent Parsing & Preprocessing:**
-  * **Layout-Aware Parsers:** For complex documents (e.g., technical manuals, PDFs with tables), traditional text extractors fail. We will employ layout-aware models (e.g., **LayoutLM**, **Nougat**) to preserve structural information, ensuring data integrity for tables, headers, and code blocks.
-  * **Noise Reduction:** Techniques like optical character recognition (OCR) cleaning, removal of boilerplate text (footers, headers), and normalization of whitespace will be applied.
-* **Semantic Chunking:**
-  * Rather than arbitrary character splits, we'll implement **semantic chunking**. This involves analyzing sentence boundaries and paragraph structures, calculating the cosine similarity between sentences. Chunks are only created when there's a significant drop in similarity, indicating a topic shift, thus preserving contextual coherence.
-  * **Recursive Character Splitting** will be used as a fallback or for initial coarse-grained splitting.
-* **Metadata Extraction & Enrichment:**
-  * Beyond basic document ID and source, we will extract valuable metadata: document title, publication date, section headers.
-  * **LLM-based Tagging/Summarization:** A smaller, faster LLM can generate concise summaries or extract key terms/tags for each chunk, improving retrieval for specific queries.
-  * **Synthetic Q&A Generation:** For low-density documents, a specialized LLM can generate synthetic question-answer pairs from the chunk, which can be stored as metadata or used for pre-training a lightweight retriever.
-* **Embedding Generation:** Utilize a state-of-the-art embedding model (e.g., OpenAI `text-embedding-3-large`, `E5-Mistral`, or `mxbai-embed-large` for on-premise) to convert processed text chunks into high-dimensional vectors.
+---
 
-## 2. High-Performance Storage & Retrieval
+### **2. Storage & Efficient Retrieval**
 
-This layer focuses on storing vectors efficiently and retrieving the most relevant information with minimal latency.
+**A. Vector Database Architecture**
 
-**Visual Cue:** _Imagine a diagram showing the interaction between the Query, Vector DB, and Search Index._
+* **Technology**: Choose **Pinecone Serverless** (managed) or **Qdrant/Milvus** (self-hosted) for production scale
+* **Index Configuration**:
+  * **Algorithm**: HNSW (Hierarchical Navigable Small World) for low-latency (\<10ms) approximate nearest neighbor search
+  * **Parameters**: `M=16`, `efConstruction=200` for recall/latency tradeoff
+  * **Vector dimension**: 1536 (OpenAI) or 1024 (BGE)
 
-`                                [User Query]
-                                     ↓
-                               [Query Embedding]
-                                     ↓
-[Sparse Index (BM25)] <-----> [Hybrid Search Orchestrator] <-----> [Dense Index (HNSW in Vector DB)]
-        ↑                                   ↓
-[Keyword Search Results]                  [Vector Search Results]
-        ↓                                   ↓
-[Reciprocal Rank Fusion (RRF)] ----------------> [Top K Candidates for Reranking]
-`
+**B. Hybrid Search System**
 
-### Key Components & Strategies:
+* **Two-stage retrieval**:
+  1. **Dense retrieval**: Vector similarity search (top-100)
+  2. **Sparse retrieval**: BM25 on extracted keywords for lexical matching
+* **Fusion**: Use Reciprocal Rank Fusion (RRF) to combine and re-rank results
+* **Metadata Filtering**: Pre-filter by customer tier, product version, or doc category before vector search (reduces search space by 90%)
 
-* **Vector Database (e.g., Weaviate, Qdrant, Milvus):**
-  * **Index Type: HNSW (Hierarchical Navigable Small World):** This is the industry-standard Approximate Nearest Neighbor (ANN) algorithm, offering an excellent balance of recall and search latency (logarithmic complexity with increasing data).
-  * **Quantization:** For extremely large datasets or memory-constrained environments, **Product Quantization (PQ)** or **Binary Quantization** can be applied to reduce the vector size, minimizing memory footprint and I/O operations, with a slight trade-off in recall.
-  * **Schema Design:** The Vector DB schema will store the vector, the original text chunk, comprehensive metadata (source URL, title, tags, generated summary), and potentially synthetic Q&A pairs.
-* **Hybrid Search with Reciprocal Rank Fusion (RRF):**
-  * **Challenge:** Pure semantic (vector) search can miss exact keyword matches (e.g., product IDs, error codes), while keyword search lacks semantic understanding.
-  * **Solution:** Implement **Hybrid Search**:
-    * **Dense Retrieval:** Utilizes the vector embeddings for conceptual similarity.
-    * **Sparse Retrieval:** Leverages traditional keyword algorithms like **BM25** for exact match and frequency-based relevance.
-  * **Fusion Strategy: Reciprocal Rank Fusion (RRF):** This algorithm merges the ranked lists from both dense and sparse retrievers, normalizing their scores to produce a single, robust ranked list of candidate documents. This ensures both conceptual relevance and keyword precision are captured.
+**C. Performance Optimization**
 
-## 3. The Inference Layer: Precision, Speed & Trust
+* **Caching**: Redis for hot queries (first 24h), semantic cache (FAISS index of recent queries)
+* **Sharding**: Shard by customer/region for data isolation and horizontal scaling
+* **Replication**: 3 replicas for high availability and read scaling
 
-This is where the retrieved information is processed by the LLM to generate accurate and trustworthy answers.
+---
 
-**Visual Cue:** _Imagine a flow diagram of the query to response path, highlighting reranking and guardrails._
+### **3. Fast & Accurate Answer Generation**
 
-`[User Query]
-      ↓
-[Hybrid Search & RRF]
-      ↓
-[Top 50 Candidate Chunks]
-      ↓
-[Cross-Encoder Reranker] <-----> [Reranker Model (e.g., BGE-Reranker)]
-      ↓
-[Top 5-10 Most Relevant Chunks (Optimized Order)]
-      ↓
-[Prompt Engineering Module] <-----> [LLM (e.g., GPT-4o, Claude 3.5 Sonnet)]
-      ↓ (Structured JSON Output: Answer + Citations)
-[Response Post-Processor & Guardrails]
-      ↓ (Citations Validation)
-[Final Answer & Citations to User]
-      ↓
-[Caching Layer (Semantic Cache)]
-`
+**A. Retrieval-Augmented Generation (RAG) Pipeline**
 
-### Key Components & Strategies:
+* **Query Understanding**: Use LLM to rewrite/expand user queries (hyde approach for ambiguous questions)
+* **Context Retrieval**:
+  * **Reranking**: Apply cross-encoder (Cohere rerank or `ms-marco-MiniLM-L-6-v2`) on top-50 results to get final top-5 chunks
+  * **Context windows**: Fit \~5 chunks (4k tokens) into LLM context, prioritizing reranked order
+* **LLM Selection**:
+  * **Primary**: GPT-4-turbo for accuracy (complex queries)
+  * **Fallback**: Mixtral-8x7B or Claude-3-Sonnet for latency-sensitive cases
+  * **Streaming**: Enable token streaming for \<1s time-to-first-token
 
-* **Two-Stage Retrieval with Cross-Encoder Reranking:**
-  * **Stage 1 (Initial Retrieval):** The Hybrid Search (Sparse + Dense + RRF) quickly retrieves a broader set of \~50 candidate chunks. This stage prioritizes recall over precision.
-  * **Stage 2 (Reranking):** These 50 candidates are then fed into a **Cross-Encoder Reranker model** (e.g., Cohere Rerank, BGE-Reranker). Unlike bi-encoders (used for initial embeddings), cross-encoders take the query and each document _pair_ as input, allowing for a much deeper contextual understanding and producing highly accurate relevance scores. This refines the initial set down to the top 5-10 most relevant chunks.
-* **Context Optimization & Prompt Engineering:**
-  * **"Lost in the Middle" Mitigation:** LLMs often pay less attention to information located in the middle of a long context window. We will strategically place the highest-ranked chunks at the **beginning and end** of the context provided to the LLM, with lower-ranked but still relevant information in the middle.
-  * **Dynamic Prompting:** The system prompt will be dynamically constructed, incorporating the user query, the retrieved context, and strict instructions for the LLM (e.g., "Answer only using the provided context. If the information is not present, state that you cannot answer.").
-* **Response Generation with Guardrails:**
-  * **Structured Output:** We will enforce LLM output in a structured format (e.g., JSON), including `{"answer": "...", "citations": [{"id": "chunk_id", "source_url": "..."}]}`.
-  * **Citation Validation:** A post-processing step will validate that all cited `chunk_id`s actually originated from the retrieved context, preventing the LLM from hallucinating sources.
-* **Semantic Caching:**
-  * **Purpose:** Significantly reduce latency and LLM API costs.
-  * **Mechanism:** Before sending a query to the full RAG pipeline, we check a semantic cache (e.g., Redis with vector search capabilities). If a semantically similar query has been answered recently, the cached response is served immediately. This requires an embedding of the query and a similarity search against cached queries.
-* **Streaming Responses:** For enhanced user experience, tokens generated by the LLM will be streamed to the user interface as they become available, giving the perception of instantaneous response.
+**B. Accuracy & Guardrails**
 
-## 4. Observability, Evaluation & Feedback Loop
+* **Prompt Engineering**:
 
-A production-grade system requires continuous monitoring and improvement.
+  Copy
 
-**Visual Cue:** _Imagine a circular diagram representing the feedback loop._
+  `"You are a support agent. Answer based ONLY on provided context. 
+  If uncertain, respond: 'I don't have that information.' 
+  Cite sources with [doc:filename]."`
+* **Hallucination Detection**:
+  * Faithfulness check: Use NLI model to verify answer is entailed by context
+  * **Confidence scoring**: If faithfulness \< 0.8, trigger escalation
+* **Human-in-the-loop**: Log low-confidence answers for expert review, auto-retrain on corrections
 
-`[System User] <---> [Chatbot UI]
-      ↑                     ↓ (User Feedback: Thumbs Up/Down)
-[RAG System] <---> [Logging & Monitoring]
-      ↓                     ↓ (Bad Runs, Low Confidence Scores)
-[Evaluation Metrics (RAGAS)] <---> [Data Annotation Platform]
-      ↓                                      ↓
-[Retriever/Reranker/LLM Fine-tuning] <---- [Human Review & Ground Truth Labeling]
-`
+**C. Latency & Scalability**
 
-### Key Components & Strategies:
+* **Async processing**: Celery/Ray for batch ingestion (1000+ docs/hour)
+* **Caching**: Cache common answers (e.g., "how to reset password") in Redis TTL=24h
+* **AB testing**: Route 10% traffic to new embedding models for offline evaluation
+* **Monitoring**: Track **p95 latency**, **retrieval recall@5**, and **answer acceptance rate** via LangSmith/Phoenix
 
-* **RAGAS Evaluation Framework:** Implement an automated evaluation pipeline using metrics from the **RAGAS** framework:
-  * **Faithfulness:** Measures how factually consistent the generated answer is with the retrieved context.
-  * **Answer Relevance:** Assesses if the answer directly addresses the user's question.
-  * **Context Recall:** Determines if all necessary information for the answer was present in the retrieved context.
-  * **Context Precision:** Measures how precise and relevant the retrieved context chunks are.
-* **User Feedback Integration:** The chatbot UI will include explicit "Thumbs Up/Down" feedback mechanisms. This user input is crucial for identifying areas of failure (hallucinations, incorrect answers).
-* **Monitoring & Alerting:**
-  * Track key performance indicators: latency, token usage, cache hit rate, and (via RAGAS) answer quality.
-  * Monitor for high LLM hallucination scores or low relevance scores to proactively identify issues.
-* **Continuous Improvement Loop:**
-  * "Bad runs" (identified by negative user feedback or low RAGAS scores) are automatically logged.
-  * These logs become a dataset for human review and annotation, generating ground truth data.
-  * This refined dataset is then used to fine-tune and improve the embedding models, rerankers, or even the small LLMs used for metadata extraction, continuously enhancing system performance.
+---
+
+### **Key Metrics to Track**
+
+* **Ingestion**: Docs/hour, failed parse rate (\<1%)
+* **Retrieval**: Query latency p95 (\<100ms), recall@5 (\>85%)
+* **Generation**: TTFT (\<1s), hallucination rate (\<5%), resolution rate (\>70%)
+
+This architecture balances quality, cost, and speed while maintaining production reliability.
